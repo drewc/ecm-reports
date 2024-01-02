@@ -1,0 +1,498 @@
+#+TITLE: Reports
+
+ECM has reports. This process is about running them and presenting
+them.
+
+* HACKING
+
+#+begin_src scheme
+  (reload :std/sxml/print)
+  (reload :std/sxml/html/parser)
+  (reload :std/html)
+  (reload :std/sxml/tal/expander)
+  (reload :std/sxml/tal/syntax)
+  (reload :std/sxml/tal/toplevel)
+  (current-directory "~/src/ecm-reports/reports/ui")
+
+
+  (def reports-server (start-reports-http-server!))
+
+  (import :ecm/login/conf)
+
+  (update-conf)
+#+end_src
+
+* Main Binary
+:PROPERTIES:
+:CUSTOM_ID: main-binary
+:END:
+
+
+#+begin_src scheme :tangle reports-server.ss
+  (import ./reports/ui/dashboard :ecm/login/conf :std/getopt :std/sxml/tal/syntax)
+  (export main)
+
+  (def (main . args)
+    (call-with-getopt ecm-login-main args
+      program: "login"
+      help: "A simple httpd login server"
+      (option 'address "-a" "--address"
+        help: "server address"
+        default: "0.0.0.0:8078")))
+
+  (def (ecm-login-main opt)
+    (run (hash-ref opt 'address)))
+
+  (def reports-server #f)
+  (def (run address)
+    (displayln "P" (std/sxml/tal/syntax#current-tal-output-port))
+    (def errlog (##open-file [path: "/tmp/reports-server-error-log" create: 'maybe]))
+    (update-conf)
+    (set! reports-server (start-reports-http-server! address))
+    (current-error-port errlog)
+    (thread-join! reports-server))
+
+#+end_src
+
+* Building
+
+#+begin_src sh
+  gxpkg link github.com/drewc/ecm-reports `pwd`
+#+end_src
+
+#+begin_src scheme :tangle ./build.ss :shebang #!/usr/bin/env gxi
+    ;; -*- Gerbil -*-
+
+    (import :std/build-script)
+
+    (defbuild-script
+      '("httpd/handler"
+        "reports/ui/utils" 
+        "reports/ui/dashboard"
+        (exe: "reports-server")))
+#+end_src
+* Pre-Upstream
+
+This should be a part of gerbil.
+
+#+begin_src scheme :tangle httpd/handler.ss :mkdirp t
+  (import :std/net/httpd/handler :std/srfi/13)
+  (export #t (import: :std/net/httpd/handler))
+
+  (def (http-request-cookies req)
+    (let* ((hs (http-request-headers req))
+  	 (cj (assget "Cookie" hs))
+  	 (cookies
+            (and cj (map (lambda (c) (match (map string-trim (string-split c #\=))
+  				([a b] [a . b])))
+                         (string-split cj #\;)))))
+      (or cookies [])))
+#+end_src
+
+* Database
+
+#+PROPERTY: header-args:sql :engine postgres :cmdline "\"host=maxbakuntu.lan port=5432 user=maxclaims dbname=maxclaims\""
+
+#+begin_src sql
+  CREATE OR REPLACE FUNCTION percentage_diff (a int, b int)
+   RETURNS int LANGUAGE SQL AS $$
+    SELECT (((a - b) / ((a + b) / 2)) * 100)::int
+     FROM (SELECT $1::numeric as a, $2 as b) num;
+  $$;
+  CREATE OR REPLACE FUNCTION percentage_diff (a numeric, b numeric)
+   RETURNS int LANGUAGE SQL AS $$
+    SELECT (((a - b) / ((a + b) / 2)) * 100)::int
+     FROM (SELECT $1::numeric as a, $2 as b) num;
+  $$;
+
+  CREATE OR REPLACE FUNCTION percentage_change (a numeric, b numeric)
+   RETURNS int LANGUAGE SQL AS $$
+    SELECT (((a - b) / b ) * 100)::int
+     FROM (SELECT $1 as a, $2 as b) num;
+  $$;
+
+#+end_src
+
+Open claims this week, last week, and %change
+
+#+begin_src sql :noweb-ref open-perc-diff-sql
+  SELECT *, percentage_change(master_this_week::int, master_last_week::int) AS percentage_diff
+  FROM (SELECT opened_this_week - children_this_week AS master_this_week,
+         opened_last_week - children_last_week AS master_last_week
+  FROM
+  (SELECT (this_week).*, opened_last_week, children_last_week
+  FROM (SELECT this_week, count(claim_id) AS opened_last_week,
+         count(group_leader_id) AS children_last_week
+  FROM
+   (SELECT rng.start, rng.end,
+         count(this_week.claim_id) AS opened_this_week,
+         count(this_week.group_leader_id) AS children_this_week
+   FROM (SELECT (e.end - interval '1 week') AS start,
+       	      e.end FROM (SELECT now() - interval '1 week' AS end) e) rng
+   LEFT JOIN claim this_week
+   ON (this_week.open_date::timestamp with time zone <@ tstzrange(rng.end, now()))
+   GROUP BY "start", "end") this_week
+   LEFT JOIN claim last_week
+   ON (last_week.open_date::timestamp with time zone <@ tstzrange(this_week.start, this_week.end))
+   GROUP BY this_week) wkd) rep) master
+#+end_src
+
+Hours Logged this week, last week, and %change.
+
+#+begin_src sql :noweb-ref hours-logged-diff-sql
+  SELECT hours_logged_this_week, hours_logged_last_week,
+              percentage_change(hours_logged_this_week, hours_logged_last_week)
+  FROM (SELECT (this_week).hours_logged_this_week, hours_logged_last_week
+   FROM (SELECT this_week, sum(last_week.minutes) AS hours_logged_last_week
+    FROM (SELECT rng, sum(minutes) AS hours_logged_this_week
+     FROM timecard this_week JOIN
+      (SELECT (e.end - interval '1 week') AS start, e.end FROM
+       (SELECT now() - interval '1 week' AS end) e) rng ON (this_week.date > rng.end)
+         WHERE this_week.date IS NOT NULL GROUP BY rng) this_week
+         LEFT JOIN timecard last_week
+         ON (last_week.date <@ tstzrange((this_week.rng).start, (this_week.rng).end))
+              GROUP BY this_week) hrs) rep;
+#+end_src
+
+Dollars Billed this, last, change
+
+#+begin_src sql :noweb-ref dollars-billed-diff-sql
+     SELECT this_week::money, last_week::money, percentage_change(this_week, last_week)
+      FROM (SELECT sum(CASE WHEN transaction_date > rng.end THEN amount ELSE 0 END) AS this_week,
+                   sum(CASE WHEN transaction_date <= rng.end THEN amount ELSE 0 END) AS last_week
+      FROM claim_transaction two
+      JOIN (SELECT (e.end - interval '1 week') AS start, e.end
+            FROM (SELECT now() - interval '1 week' AS end) e) rng ON (two.transaction_date > rng.start)
+       WHERE two.transaction_type_id = 4 AND two.transaction_heading = 'TPA' AND person_name(two.payee_id) ILIKE 'Maxwell%') rep ;
+#+end_src
+
+#+RESULTS:
+| this_week  | last_week  | percentage_change |
+|------------+------------+-------------------|
+| $51,252.23 | $94,740.02 |               -46 |
+
+
+** Open Claim Indemnity
+
+#+begin_src sql
+  CREATE TABLE IF NOT EXISTS claim_indemnity (
+   claim_id INTEGER PRIMARY KEY REFERENCES claim(claim_id),
+   paid MONEY NOT NULL DEFAULT 0,
+   outstanding_reserve MONEY NOT NULL DEFAULT 0
+  );
+#+end_src
+
+#+begin_src sql
+  CREATE OR REPLACE FUNCTION claim_indemnity_upsert(int)
+  RETURNS claim_indemnity LANGUAGE SQL AS $$
+  INSERT INTO claim_indemnity(claim_id, paid, outstanding_reserve)
+   VALUES ($1, claim_indemnity_paid($1), claim_indemnity_outstanding_reserve($1))
+   ON CONFLICT (claim_id) DO UPDATE
+    SET paid = EXCLUDED.paid, outstanding_reserve = EXCLUDED.outstanding_reserve
+    WHERE claim_indemnity.claim_id = $1
+  RETURNING claim_indemnity;
+  $$;
+#+end_src
+
+#+begin_src sql
+  CREATE OR REPLACE FUNCTION claim_indemnity(claim_id INT)
+   RETURNS claim_indemnity LANGUAGE SQL AS $$
+   SELECT CASE WHEN c IS NOT NULL THEN c
+               ELSE claim_indemnity_upsert($1)
+   END FROM (SELECT (SELECT c FROM claim_indemnity c WHERE claim_id = $1) c) ex;
+  $$;
+#+end_src
+
+#+begin_src sql
+  CREATE OR REPLACE FUNCTION claim_indemnity_upsert()
+   RETURNS TRIGGER LANGUAGE PLPGSQL AS $$
+   BEGIN
+    IF (TG_OP = 'UPDATE' AND NEW.claim_id != OLD.claim_id) THEN
+     PERFORM claim_indemnity_upsert(OLD.claim_id);
+    END IF;
+    PERFORM claim_indemnity_upsert(NEW.claim_id);
+    RETURN NEW;
+   END;
+  $$;
+#+end_src
+
+#+begin_src sql
+  CREATE TRIGGER claim_indemnity_upsert
+   AFTER INSERT OR UPDATE OR DELETE ON claim
+  FOR EACH ROW EXECUTE FUNCTION claim_indemnity_upsert();
+
+  CREATE TRIGGER claim_indemnity_upsert
+   AFTER INSERT OR UPDATE OR DELETE ON claim_transaction
+  FOR EACH ROW EXECUTE FUNCTION claim_indemnity_upsert();
+
+#+end_src
+#+RESULTS:
+| CREATE TRIGGER |
+|----------------|
+| CREATE TRIGGER |
+
+** Examiner Open Claims
+
+  #+BEGIN_SRC sql :results code :exports none
+  select pg_get_functiondef(oid)||';' AS " "
+  from pg_proc
+  where proname = 'examiner_open_claims_report';
+  #+END_SRC
+
+  #+begin_src sql
+
+    CREATE OR REPLACE FUNCTION public.examiner_open_claims_report(integer DEFAULT NULL::integer)
+     RETURNS TABLE(examiner text, claim_id integer, contract_number text, policy_number text, insured text, class_of_business text, province text, incurred_indemntity numeric, outstanding_indemnity numeric)
+     LANGUAGE sql
+    AS $function$
+       SELECT * FROM (SELECT
+        person_short_name((claim).adjuster_id) AS examiner , claim_id, (contract).contract_number,
+        (policy).policy_number, person_name((policy).insured_id),
+        (claim).line_of_business, claim_province(claim_id),
+        (paid + outstanding_reserve)::numeric,
+        outstanding_reserve::numeric
+
+        FROM (SELECT (claim_indemnity(claim_id)).* FROM claim
+               WHERE status = 'Open'
+            AND (($1 IS NULL) OR (claim).adjuster_id = $1)) opens
+        LEFT JOIN claim_view USING (claim_id)
+       ) rep
+       ORDER BY examiner , claim_id;
+      $function$
+    ;
+  #+end_src
+
+  #+RESULTS:
+  | CREATE FUNCTION |
+  |-----------------|
+
+* User Interface
+
+** A user
+
+#+begin_src scheme :tangle reports/ui/user.ss
+  (import :ecm/user/database :std/db/dbi)
+
+  (export #t)
+
+
+  (def current-user-token (make-parameter #f))
+
+  (def token-user-cache (make-hash-table))
+
+
+  
+#+end_src
+
+
+
+
+** Static Files in memory
+
+The idea behind this binary is to run without the html/js/css/svg
+files being on the filesystem.
+
+#+begin_src scheme :tangle reports/ui/utils.ss
+  (import (for-syntax :std/misc/ports))
+  (export #t)
+  (defsyntax (define-file stx)
+    (syntax-case stx ()
+      ((_ var filename)
+       (stx-string? #'filename)
+       (let* ((file (stx-e #'filename))
+    	    (locat (stx-source stx))
+              (con (##locat-container locat))
+    	    (path (##container->path con))
+    	    (dir (if path (path-directory path) (current-directory)))
+    	    (u8v (read-file-u8vector (path-expand file dir))))
+         (with-syntax ((f u8v))
+  	 #'(def var f))))))
+#+end_src
+
+
+
+** Buffered TAL writer
+
+vector-pipe
+
+#+begin_src scheme :tangle reports/ui/dashboard.ss :noweb yes
+  (import :std/net/httpd/mux :std/net/httpd :std/net/uri)
+
+  (import :std/tal :std/db/dbi :ecm/user/database :ecm/user/entity)
+  (import ./utils ../../httpd/handler (only-in :std/sxml/tal/syntax
+		 define-TAL current-tal-output-port
+		 current-tal:on-error tal:write))
+
+  (export #t)
+
+  (define-TAL (dashboard.html summaries open-claims) file: "./html/dashboard.html")
+
+  (define-file dashboard.css "./css/dashboard.css")
+
+  (def (handle-dashboard.css _ res)
+    (http-response-write
+     res 200 `(("Content-Type" . "text/css")) dashboard.css))
+
+  (define-file chartScripts.js "./js/chartScripts.js")
+
+  (def (handle-chartScripts.js _ res)
+    (http-response-write
+     res 200 `(("Content-Type" . "text/javascript")) chartScripts.js))
+
+  (def open-diff-sql #<<EOF
+    <<open-perc-diff-sql>>
+  EOF
+  )
+
+  (def hours-logged-diff-sql #<<EOF
+    <<hours-logged-diff-sql>>
+  EOF
+  )
+  (def dollars-billed-diff-sql #<<EOF
+    <<dollars-billed-diff-sql>>
+  EOF
+  )
+
+
+  (def (sql-q con q)
+    (match (sql-eval-query con q)
+      ([row] row)))
+
+  (def (sql-open-diff con)
+    (sql-q con open-diff-sql))
+
+  (def (sql-hours-diff con)
+    (sql-q con hours-logged-diff-sql))
+
+  (def (sql-dollars-diff con)
+    (sql-q con dollars-billed-diff-sql))
+
+  (def (sql-examiner-claims con)
+    (let (stmt
+  	(sql-prepare con "SELECT * FROM examiner_open_claims_report() rep -- WHERE claim_id = 69333"))
+      [(sql-columns stmt)
+       (sql-query stmt) ...]))
+
+  (def (dashboard-handler req res)
+    (def fn (path-strip-directory (http-request-path req)))
+    (def cookies (http-request-cookies req))
+    (def token (assget "ecm-login" cookies))
+    (def new-claims #f)
+    (def hours-logged #f)
+    (def dollars-billed #f)
+    (def open-claims #f)
+
+    ;; (displayln "Tok:" token " Outp:" (current-tal-output-port))
+    (call-with-token-connection
+     token (lambda (c)
+  	   (displayln "conn"
+  		      (let (user-id (match (sql-eval-query c "SELECT login.token_user_id($1)" token)
+  				      ([id] id) (else #f)))
+  			(and user-id (get-user user-id db: c))))
+  	   (set! hours-logged (sql-hours-diff c))
+  	   (set! dollars-billed (sql-dollars-diff c))
+  	   (set! new-claims (sql-open-diff c))
+  	   (set! open-claims (sql-examiner-claims c))
+
+  	    
+  	    
+  	   ))
+    (cond ((equal? fn "dashboard.css")
+  	 (handle-dashboard.css req res))
+  	((equal? fn "chartScripts.js")
+  	 (handle-chartScripts.js req res))
+  	(else 
+  	 (let (v (call-with-output-u8vector
+  		  #u8() (lambda (p) (parameterize ((current-tal-output-port p))
+  				 (dashboard.html [["New Claims" "icon:eye" new-claims]
+  						  ["Hours Logged" "icon:clock" hours-logged]
+  						  ["Dollars Billed" "icon:credit-card" dollars-billed]
+  						  ]
+  						 open-claims)))))
+  	   (http-response-write res 200 `(("Content-Type" . "text/html")) v)))))
+  				      
+  (def reports-mux
+    (make-static-http-mux
+     (list->hash-table
+      `(("/ecm/new/reports" .,(cut dashboard-handler <> <>))))
+     (cut dashboard-handler <> <>)))
+
+  (def (start-reports-http-server! (address "0.0.0.0:8078"))
+    (start-http-server! address mux: reports-mux))
+
+
+#+end_src
+
+** Upstream files
+
+#+begin_src bash :session ecm-reports-shell
+  mkdir -p reports/ui/css/ 
+  mkdir -p reports/ui/js/ 
+  mkdir -p reports/ui/html/
+
+  cd reports/ui/html
+  wget https://zzseba78.github.io/Kick-Off/dashboard.html
+#+end_src
+
+#+begin_src bash :session ecm-reports-shell
+  cd ../css
+  wget 'https://zzseba78.github.io/Kick-Off/css/dashboard.css'
+  wget 'https://cdn.jsdelivr.net/npm/uikit@latest/dist/css/uikit.min.css'
+#+end_src
+
+#+begin_src bash :session ecm-reports-shell
+  cd ../css
+  wget 'https://zzseba78.github.io/Kick-Off/css/dashboard.css'
+  wget 'https://cdn.jsdelivr.net/npm/uikit@latest/dist/css/uikit.min.css'
+#+end_src
+
+#+begin_src bash :session ecm-reports-shell
+  cd ../js
+  wget 'https://cdn.jsdelivr.net/npm/uikit@latest/dist/js/uikit.min.js'
+  wget 'https://cdn.jsdelivr.net/npm/uikit@latest/dist/js/uikit-icons.min.js'
+  wget 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.8.0/Chart.min.js'
+  wget 'https://zzseba78.github.io/Kick-Off/js/chartScripts.js'
+#+end_src
+
+
+
+* HTTPD
+
+
+
+* Background Threads
+
+Some reports take an inordinatly long time to complete. While I intend
+to "work on that", it's still better to have an async
+method. Especially for the http server threads.
+
+#+begin_src scheme
+  (import :ecm/user/database :std/misc/uuid :std/contract :std/db/dbi)
+
+  (defstruct report-thread (uuid path green-thread)
+    constructor: :init! transparent: #t)
+
+  (def (ensure-report-thread-path rt ext: (ext "csv") tmp: (tmp "/tmp"))
+    (using (rt :- report-thread)
+      (or rt.path
+  	(let ((dir (string-append
+  		    tmp "/report-thread-" rt.uuid))
+  	      (file (string-append rt.uuid "." ext)))
+  	  (create-directory* dir)
+  	  (set! rt.path (string-append dir"/"file))
+  	  rt.path))))
+    
+  (defmethod {:init! report-thread}
+    (lambda (self)
+      (using (rt self :- report-thread)
+        (set! rt.uuid (uuid->string (random-uuid)))
+        (set! rt.path #f))))
+
+#+end_src
+
+
+
+
+
+
+
