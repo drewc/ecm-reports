@@ -7,7 +7,9 @@
 
 (export #t)
 
-(define-TAL (dashboard.html summaries open-claims) file: "./html/dashboard.html")
+(def %rebuild 0)
+
+(define-TAL (dashboard.html summaries open-claims user) file: "./html/dashboard.html")
 
 (define-file dashboard.css "./css/dashboard.css")
 
@@ -84,11 +86,26 @@ EOF
 (def (sql-dollars-diff con)
   (sql-q con dollars-billed-diff-sql))
 
-(def (sql-examiner-claims con)
+(def (sql-examiner-claims-headers con)
   (let (stmt
-	(sql-prepare con "SELECT * FROM examiner_open_claims_report() rep -- WHERE claim_id = 69333"))
-    [(sql-columns stmt)
-     (sql-query stmt) ...]))
+	(sql-prepare con "SELECT * FROM examiner_open_claims_report()
+         ORDER BY examiner LIMIT 0 -- WHERE claim_id = 69333"))
+    
+    [(sql-columns stmt)]))
+
+(def (sql-examiner-claims-json con)
+  (let (stmt
+	(sql-prepare con "SELECT * FROM examiner_open_claims_report_json()"))
+    (car (sql-query stmt))))
+
+(def (handle-examiner-claims-json req res)
+  (def cookies (http-request-cookies req))
+  (def token (assget "ecm-login" cookies))
+  (let (jso (call-with-token-connection token sql-examiner-claims-json))
+    (http-response-write
+     res 200 `(("Content-Type" . "application/json")) jso)))
+    
+
 
 (def (dashboard-handler req res)
   (def fn (path-strip-directory (http-request-path req)))
@@ -98,34 +115,39 @@ EOF
   (def hours-logged #f)
   (def dollars-billed #f)
   (def open-claims #f)
+  (def user #f)
 
   ;; (displayln "Tok:" token " Outp:" (current-tal-output-port))
-  (call-with-token-connection
-   token (lambda (c)
-	   (displayln "conn"
-		      (let (user-id (match (sql-eval-query c "SELECT login.token_user_id($1)" token)
-				      ([id] id) (else #f)))
-			(and user-id (get-user user-id db: c))))
-	   (set! hours-logged (sql-hours-diff c))
-	   (set! dollars-billed (sql-dollars-diff c))
-	   (set! new-claims (sql-open-diff c))
-	   (set! open-claims (sql-examiner-claims c))
-
-	    
-	    
-	   ))
+  
   (cond ((equal? fn "dashboard.css")
 	 (handle-dashboard.css req res))
 	((equal? fn "chartScripts.js")
 	 (handle-chartScripts.js req res))
-	(else 
+	((equal? fn "open-claims.json")
+	 (handle-examiner-claims-json req res))
+	 (else
+	  (call-with-token-connection
+	   token (lambda (c)
+		   (let* ((user-id (match (sql-eval-query c "SELECT login.token_user_id($1)" token)
+				     ([id] id) (else #f)))
+			  (usr (and user-id (get-user user-id db: c))))
+		   (displayln "conn and user" usr)
+		   (set! user usr)
+		   (set! hours-logged (sql-hours-diff c))
+		   (set! dollars-billed (sql-dollars-diff c))
+		   (set! new-claims (sql-open-diff c))
+		   (set! open-claims (sql-examiner-claims-headers c))
+
+	    
+	    
+		   )))
 	 (let (v (call-with-output-u8vector
 		  #u8() (lambda (p) (parameterize ((current-tal-output-port p))
 				 (dashboard.html [["New Claims" "icon:eye" new-claims]
 						  ["Hours Logged" "icon:clock" hours-logged]
 						  ["Dollars Billed" "icon:credit-card" dollars-billed]
 						  ]
-						 open-claims)))))
+						 open-claims user)))))
 	   (http-response-write res 200 `(("Content-Type" . "text/html")) v)))))
 				      
 (def reports-mux

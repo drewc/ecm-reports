@@ -12,14 +12,18 @@ them.
   (reload :std/sxml/tal/expander)
   (reload :std/sxml/tal/syntax)
   (reload :std/sxml/tal/toplevel)
-  (current-directory "~/src/ecm-reports/reports/ui")
+
+  (reload :ecm/reports/ui/dashboard)
 
 
-  (def reports-server (start-reports-http-server!))
 
-  (import :ecm/login/conf)
+  (import :ecm/login/conf
+  	:ecm/reports/ui/dashboard :ecm/reports/ui/utils :ecm/httpd/handler)
 
   (update-conf)
+  (current-directory "~/src/ecm-reports/reports/ui")
+  (current-error-port (open-file "/dev/null"))
+  (def reports-server (start-reports-http-server!))
 #+end_src
 
 * Main Binary
@@ -68,7 +72,7 @@ them.
     (defbuild-script
       '("httpd/handler"
         "reports/ui/utils" 
-        "reports/ui/dashboard"
+        (gxc: "reports/ui/dashboard" (extra-inputs: ("reports/ui/html/dashboard.html")))
         (exe: "reports-server")))
 #+end_src
 * Pre-Upstream
@@ -201,7 +205,7 @@ Dollars Billed this, last, change
                ELSE claim_indemnity_upsert($1)
    END FROM (SELECT (SELECT c FROM claim_indemnity c WHERE claim_id = $1) c) ex;
   $$;
-#+end_src
+#+End_src
 
 #+begin_src sql
   CREATE OR REPLACE FUNCTION claim_indemnity_upsert()
@@ -240,13 +244,13 @@ Dollars Billed this, last, change
   #+END_SRC
 
   #+begin_src sql
-
+   DROP FUNCTION IF EXISTS examiner_open_claims_report(integer) ;
     CREATE OR REPLACE FUNCTION public.examiner_open_claims_report(integer DEFAULT NULL::integer)
-     RETURNS TABLE(examiner text, claim_id integer, contract_number text, policy_number text, insured text, class_of_business text, province text, incurred_indemntity numeric, outstanding_indemnity numeric)
+     RETURNS TABLE(examiner text, examiner_id int, claim_id integer, contract_number text, policy_number text, insured text, class_of_business text, province text, incurred_indemntity numeric, outstanding_indemnity numeric)
      LANGUAGE sql
     AS $function$
        SELECT * FROM (SELECT
-        person_short_name((claim).adjuster_id) AS examiner , claim_id, (contract).contract_number,
+         person_short_name((claim).adjuster_id) AS examiner , (claim).adjuster_id AS examiner_id, claim_id, (contract).contract_number,
         (policy).policy_number, person_name((policy).insured_id),
         (claim).line_of_business, claim_province(claim_id),
         (paid + outstanding_reserve)::numeric,
@@ -261,7 +265,16 @@ Dollars Billed this, last, change
       $function$
     ;
   #+end_src
-
+#+begin_src sql
+  CREATE OR REPLACE FUNCTION examiner_open_claims_report_json(integer DEFAULT NULL::integer)
+  RETURNS json LANGUAGE SQL AS $$
+  SELECT json_build_object('head', head::json, 'data', rows)
+   FROM (SELECT head::text AS head, json_agg(row) AS rows
+         FROM (SELECT (SELECT json_agg(value) AS row FROM json_each(to_json(e))),
+                      (SELECT json_agg(key) AS head FROM json_each(to_json(e)))
+                FROM examiner_open_claims_report() e) rep GROUP BY head::text) jso;
+  $$;
+#+end_src
   #+RESULTS:
   | CREATE FUNCTION |
   |-----------------|
@@ -320,12 +333,14 @@ vector-pipe
 
   (import :std/tal :std/db/dbi :ecm/user/database :ecm/user/entity)
   (import ./utils ../../httpd/handler (only-in :std/sxml/tal/syntax
-		 define-TAL current-tal-output-port
-		 current-tal:on-error tal:write))
+  		 define-TAL current-tal-output-port
+  		 current-tal:on-error tal:write))
 
   (export #t)
 
-  (define-TAL (dashboard.html summaries open-claims) file: "./html/dashboard.html")
+  (def %rebuild 0)
+
+  (define-TAL (dashboard.html summaries open-claims user) file: "./html/dashboard.html")
 
   (define-file dashboard.css "./css/dashboard.css")
 
@@ -367,11 +382,26 @@ vector-pipe
   (def (sql-dollars-diff con)
     (sql-q con dollars-billed-diff-sql))
 
-  (def (sql-examiner-claims con)
+  (def (sql-examiner-claims-headers con)
     (let (stmt
-  	(sql-prepare con "SELECT * FROM examiner_open_claims_report() rep -- WHERE claim_id = 69333"))
-      [(sql-columns stmt)
-       (sql-query stmt) ...]))
+  	(sql-prepare con "SELECT * FROM examiner_open_claims_report()
+           ORDER BY examiner LIMIT 0 -- WHERE claim_id = 69333"))
+      
+      [(sql-columns stmt)]))
+
+  (def (sql-examiner-claims-json con)
+    (let (stmt
+  	(sql-prepare con "SELECT * FROM examiner_open_claims_report_json()"))
+      (car (sql-query stmt))))
+
+  (def (handle-examiner-claims-json req res)
+    (def cookies (http-request-cookies req))
+    (def token (assget "ecm-login" cookies))
+    (let (jso (call-with-token-connection token sql-examiner-claims-json))
+      (http-response-write
+       res 200 `(("Content-Type" . "application/json")) jso)))
+      
+
 
   (def (dashboard-handler req res)
     (def fn (path-strip-directory (http-request-path req)))
@@ -381,34 +411,39 @@ vector-pipe
     (def hours-logged #f)
     (def dollars-billed #f)
     (def open-claims #f)
+    (def user #f)
 
     ;; (displayln "Tok:" token " Outp:" (current-tal-output-port))
-    (call-with-token-connection
-     token (lambda (c)
-  	   (displayln "conn"
-  		      (let (user-id (match (sql-eval-query c "SELECT login.token_user_id($1)" token)
-  				      ([id] id) (else #f)))
-  			(and user-id (get-user user-id db: c))))
-  	   (set! hours-logged (sql-hours-diff c))
-  	   (set! dollars-billed (sql-dollars-diff c))
-  	   (set! new-claims (sql-open-diff c))
-  	   (set! open-claims (sql-examiner-claims c))
-
-  	    
-  	    
-  	   ))
+    
     (cond ((equal? fn "dashboard.css")
   	 (handle-dashboard.css req res))
   	((equal? fn "chartScripts.js")
   	 (handle-chartScripts.js req res))
-  	(else 
+  	((equal? fn "open-claims.json")
+  	 (handle-examiner-claims-json req res))
+  	 (else
+  	  (call-with-token-connection
+  	   token (lambda (c)
+  		   (let* ((user-id (match (sql-eval-query c "SELECT login.token_user_id($1)" token)
+  				     ([id] id) (else #f)))
+  			  (usr (and user-id (get-user user-id db: c))))
+  		   (displayln "conn and user" usr)
+  		   (set! user usr)
+  		   (set! hours-logged (sql-hours-diff c))
+  		   (set! dollars-billed (sql-dollars-diff c))
+  		   (set! new-claims (sql-open-diff c))
+  		   (set! open-claims (sql-examiner-claims-headers c))
+
+  	    
+  	    
+  		   )))
   	 (let (v (call-with-output-u8vector
   		  #u8() (lambda (p) (parameterize ((current-tal-output-port p))
   				 (dashboard.html [["New Claims" "icon:eye" new-claims]
   						  ["Hours Logged" "icon:clock" hours-logged]
   						  ["Dollars Billed" "icon:credit-card" dollars-billed]
   						  ]
-  						 open-claims)))))
+  						 open-claims user)))))
   	   (http-response-write res 200 `(("Content-Type" . "text/html")) v)))))
   				      
   (def reports-mux

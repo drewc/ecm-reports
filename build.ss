@@ -6,5 +6,5 @@
 (defbuild-script
   '("httpd/handler"
     "reports/ui/utils" 
-    "reports/ui/dashboard"
+    (gxc: "reports/ui/dashboard" (extra-inputs: ("reports/ui/html/dashboard.html")))
     (exe: "reports-server")))
